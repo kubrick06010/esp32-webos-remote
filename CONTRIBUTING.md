@@ -1,12 +1,12 @@
-# Contribuir
+# Contributing
 
-Las mejoras y adaptaciones a otras placas son bienvenidas.
+Improvements and ports to other boards are welcome.
 
-1. Crea una rama para el cambio.
-2. No incluyas `include/config.h`, claves de emparejamiento, direcciones MAC
-   reales ni credenciales Wi‑Fi.
-3. Ejecuta `pio run` antes de abrir el pull request.
-4. Describe la placa, versión del framework y modelo de TV usado para probarlo.
+1. Create a branch for your change.
+2. Do not include `include/config.h`, pairing keys, real MAC addresses, or
+   Wi-Fi credentials.
+3. Run `pio run` before opening a pull request.
+4. Describe the board, framework version, and TV model used for testing.
 
-Para cambios de hardware, documenta los GPIO y cualquier resistencia o módulo
-externo necesario.
+For hardware changes, document GPIO assignments and any required resistor or
+external module.

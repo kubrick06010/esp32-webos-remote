@@ -1,47 +1,46 @@
 # ESP32 webOS Remote
 
-Un mando web local y extensible para televisores LG webOS, con Wake-on-LAN,
-emparejamiento SSAP/WebSocket y actualización OTA. Está pensado como base para
-automatizaciones maker: el mismo ESP32 puede añadir sensores, LEDs, relés y
-otras rutas HTTP.
+A local, extensible web remote for LG webOS TVs, with Wake-on-LAN,
+SSAP/WebSocket pairing, and OTA updates. It is designed as a foundation for
+maker automation: the same ESP32 can add sensors, LEDs, relays, and other HTTP
+routes.
 
-Mando web autónomo para la TV LG webOS. El ESP32 sirve la interfaz en
-`http://televisor.local` (también mediante la IP configurada), controla la TV por SSAP/WebSocket y la enciende mediante
-Wake-on-LAN.
+The ESP32 serves the remote at `http://televisor.local` (or its configured IP),
+controls the TV over SSAP/WebSocket, and powers it on through Wake-on-LAN.
 
-## Hardware probado
+## Tested hardware
 
-- ESP32-C3 con 4 MB de flash (`esp32-c3-devkitm-1`).
-- La TV y el ESP32 deben estar en la misma red local.
-- Configura la IP y MAC de tu TV en `include/config.h`.
+- ESP32-C3 with 4 MB flash (`esp32-c3-devkitm-1`).
+- The TV and ESP32 must be on the same local network.
+- Set your TV IP address and MAC address in `include/config.h`.
 
-La placa probada usa USB Serial/JTAG nativo; cualquier placa ESP32-C3
-compatible con Arduino/PlatformIO debería poder adaptarse cambiando `board`.
+The tested board uses native USB Serial/JTAG. Other ESP32-C3 boards supported by
+Arduino/PlatformIO can be adapted by changing `board`.
 
-## Primera instalación
+## First installation
 
-1. Instala PlatformIO y conecta el ESP32 por USB.
-2. Copia `include/config.example.h` como `include/config.h` y adapta IP, MAC y
-   broadcast de tu instalación. `include/config.h` está excluido del repositorio.
-3. Ejecuta `pio run -e esp32c3 -t upload` desde esta carpeta.
-3. Si el ESP32 no conserva credenciales Wi-Fi, conéctate al punto de acceso
-   `webOS-Remote-Setup` y selecciona tu red.
-5. Abre `http://televisor.local` o la IP configurada.
-5. Enciende la TV y acepta la solicitud de emparejamiento. La clave se almacena
-   en NVS y no queda incluida en el firmware ni en el repositorio.
+1. Install PlatformIO and connect the ESP32 over USB.
+2. Copy `include/config.example.h` to `include/config.h` and set your IP, MAC,
+   and broadcast address. `include/config.h` is ignored by this repository.
+3. Run `pio run -e esp32c3 -t upload` from this directory.
+4. If the ESP32 has no saved Wi-Fi credentials, connect to the
+   `webOS-Remote-Setup` access point and select your network.
+5. Open `http://televisor.local` or the configured IP address.
+6. Turn on the TV and accept the pairing request. The key is stored in NVS and
+   is never included in the firmware source or repository.
 
-## Actualizaciones OTA
+## OTA updates
 
-Después de la primera carga USB, usa `pio run -e esp32c3_ota -t upload
---upload-port <IP_DEL_ESP32>`. OTA no está disponible hasta que este firmware
-haya sido instalado al menos una vez por USB.
+After the first USB upload, run `pio run -e esp32c3_ota -t upload
+--upload-port <ESP32_IP>`. OTA is not available until this firmware has been
+installed at least once over USB.
 
-## Seguridad
+## Security
 
-La interfaz solo se publica en la red local y no tiene autenticación. No abras
-el puerto 80 del ESP32 hacia Internet. El firmware solo expone botones normales;
-no contiene comandos de calibración ni menús de servicio.
+The interface is exposed only on the local network and has no authentication.
+Do not expose the ESP32 port 80 to the Internet. The firmware exposes normal
+remote buttons only; it contains no calibration or service-menu commands.
 
-## Licencia
+## License
 
-MIT. Consulta [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
