@@ -8,6 +8,39 @@ routes.
 The ESP32 serves the remote at `http://televisor.local` (or its configured IP),
 controls the TV over SSAP/WebSocket, and powers it on through Wake-on-LAN.
 
+![ESP32 webOS Remote design](docs/remote-design.png)
+
+## Requirements
+
+### Hardware
+
+- ESP32-C3 with at least 4 MB flash. The reference target is
+  `esp32-c3-devkitm-1`.
+- A LG TV running webOS with network control enabled.
+- USB cable for the first firmware upload.
+- The ESP32 and TV connected to the same local network.
+
+### Software
+
+- PlatformIO Core or PlatformIO IDE.
+- Python 3 for PlatformIO's tooling.
+- A modern browser on the same LAN (Safari, Chrome, Firefox, or mobile Safari).
+
+### TV configuration
+
+- Enable **TV On With Mobile** / **Turn on via Wi-Fi** in the TV network or
+  external-device settings.
+- Note the TV's IP address and MAC address.
+- Accept the webOS pairing prompt on the TV during first connection.
+
+### Network requirements
+
+- A 2.4 GHz-compatible Wi-Fi connection for boards that do not support 5 GHz.
+- Local TCP access to the TV's webOS control port (normally `3001`).
+- Wake-on-LAN broadcast traffic allowed on the local subnet for power-on.
+- mDNS/Bonjour allowed if you want to use `televisor.local`; the configured IP
+  address remains an alternative.
+
 ## Tested hardware
 
 - ESP32-C3 with 4 MB flash (`esp32-c3-devkitm-1`).
