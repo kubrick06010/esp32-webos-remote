@@ -1,0 +1,10 @@
+.pio/
+.platformio/
+.venv/
+.idea/
+.vscode/
+include/config.h
+*.bin
+*.elf
+*.map
+.DS_Store
