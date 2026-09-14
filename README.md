@@ -8,7 +8,7 @@ routes.
 The ESP32 serves the remote at `http://televisor.local` (or its configured IP),
 controls the TV over SSAP/WebSocket, and powers it on through Wake-on-LAN.
 
-![ESP32 webOS Remote design](docs/remote-design.png)
+![Actual ESP32 webOS Remote interface](docs/remote-design.png)
 
 ## Requirements
 
