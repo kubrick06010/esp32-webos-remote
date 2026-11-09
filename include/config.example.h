@@ -1,6 +1,12 @@
 #pragma once
 
 // Copy this file to include/config.h and adapt the values to your network.
+
+// Optional preferred Wi-Fi (2.4 GHz only). Leave WIFI_SSID empty to rely on the
+// webOS-Remote-Setup captive portal; it is also used as a fallback.
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
 #define REMOTE_HOSTNAME "televisor"
 #define REMOTE_IP 192, 168, 1, 247
 #define REMOTE_GATEWAY 192, 168, 1, 1

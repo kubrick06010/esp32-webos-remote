@@ -178,9 +178,20 @@ void setup() {
   IPAddress local(REMOTE_IP), gateway(REMOTE_GATEWAY), subnet(REMOTE_SUBNET);
   WiFi.config(local, gateway, subnet);
   WiFi.setHostname(REMOTE_HOSTNAME);
-  WiFiManager manager;
-  manager.setConfigPortalTimeout(180);
-  if (!manager.autoConnect("webOS-Remote-Setup")) ESP.restart();
+#if defined(WIFI_SSID)
+  if (strlen(WIFI_SSID) > 0) {
+    Serial.printf("Wi-Fi: connecting to %s\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    const uint8_t result = WiFi.waitForConnectResult(20000);
+    Serial.printf("Wi-Fi: status %u (3=connected, 1=SSID not found, 4=failed/wrong password)\n", result);
+  }
+#endif
+  if (!WiFi.isConnected()) {
+    WiFiManager manager;
+    manager.setConfigPortalTimeout(180);
+    manager.setConnectTimeout(20);
+    if (!manager.autoConnect("webOS-Remote-Setup")) ESP.restart();
+  }
   if (MDNS.begin(REMOTE_HOSTNAME)) {
     MDNS.addService("http", "tcp", 80);
     MDNS.addServiceTxt("http", "tcp", "path", "/");
