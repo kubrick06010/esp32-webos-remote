@@ -23,6 +23,8 @@ bool registered = false;
 bool pointerConnected = false;
 String clientKey;
 String lastAction = "None yet";
+String pendingId;        // id of the last SSAP request still awaiting a reply
+String pendingCommand;   // remote button that produced it
 uint32_t requestId = 1;
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="es"><head>
@@ -39,7 +41,7 @@ const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="es"><head>
 <div class="colors"><button class="b color r" data-c="RED">R</button><button class="b color g" data-c="GREEN">G</button><button class="b color y" data-c="YELLOW">Y</button><button class="b color bl" data-c="BLUE">B</button></div>
 <div class="grid"><button class="b" data-c="REWIND">◀◀</button><button class="b" data-c="PLAY">▶</button><button class="b" data-c="FASTFORWARD">▶▶</button></div>
 <div class="apps"><button class="b appb netflix" data-c="NETFLIX">NETFLIX</button><button class="b appb prime" data-c="AMAZON">prime video</button></div></section><div class="activity"><b>Last action:</b> <span id="a">None yet</span></div></main>
-<script>const s=document.querySelector('#s'),a=document.querySelector('#a');async function status(){try{let d=await(await fetch('/api/status')).json();s.className=d.registered?'ok':'bad';s.innerHTML='<i class="dot"></i> '+(d.registered?'Connected':d.control?'Pairing…':'Offline');a.textContent=d.last||a.textContent}catch(e){s.className='bad';s.innerHTML='<i class="dot"></i> Offline'}}async function send(c){a.textContent='Sending '+c+'…';try{let r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:c})}),d=await r.json();a.textContent=d.message||d.error;if(c==='POWER')setTimeout(status,5000)}catch(e){a.textContent='Error: '+e.message}status()}document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>send(b.dataset.c));status();setInterval(status,5000)</script></body></html>)HTML";
+<script>const s=document.querySelector('#s'),a=document.querySelector('#a');async function status(){try{let d=await(await fetch('/api/status')).json();s.className=d.registered?'ok':'bad';s.innerHTML='<i class="dot"></i> '+(d.registered?(d.pointer?'Connected':'Connected · input pending'):d.control?'Pairing…':'Offline');a.textContent=d.last||a.textContent}catch(e){s.className='bad';s.innerHTML='<i class="dot"></i> Offline'}}async function send(c){a.textContent='Sending '+c+'…';try{let r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:c})}),d=await r.json();a.textContent=d.message||d.error;setTimeout(status,1500);if(c==='POWER')setTimeout(status,5000)}catch(e){a.textContent='Error: '+e.message}status()}document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>send(b.dataset.c));status();setInterval(status,5000)</script></body></html>)HTML";
 
 const char *buttonCommands[] = {"INPUT_HUB", "MENU", "MUTE", "UP", "DOWN", "LEFT", "RIGHT", "ENTER", "BACK", "HOME", "EXIT", "RED", "GREEN", "YELLOW", "BLUE", "REWIND", "PLAY", "PAUSE", "STOP", "FASTFORWARD", "NETFLIX", "AMAZON", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
 
@@ -71,13 +73,24 @@ void sendWakeOnLan() {
   udp.stop();
 }
 
-void sendRequest(const String &uri, const JsonDocument *payload = nullptr, const String &fixedId = "") {
+String sendRequest(const String &uri, const JsonDocument *payload = nullptr, const String &fixedId = "") {
   JsonDocument message;
-  message["id"] = fixedId.length() ? fixedId : String("req_") + requestId++;
+  String id = fixedId.length() ? fixedId : String("req_") + requestId++;
+  message["id"] = id;
   message["type"] = "request";
   message["uri"] = uri;
   if (payload) message["payload"] = *payload;
   String output; serializeJson(message, output); controlWs.sendTXT(output);
+  Serial.printf("TV -> %s\n", output.c_str());
+  return id;
+}
+
+// Sends a remote-control key through the network-input socket.  The TV treats
+// it exactly like the physical remote.
+void sendButton(const String &name) {
+  String frame = String("type:button\nname:") + name + "\n\n";
+  pointerWs.sendTXT(frame);
+  Serial.printf("TV -> button %s\n", name.c_str());
 }
 
 void requestPointerSocket() { sendRequest("ssap://com.webos.service.networkinput/getPointerInputSocket", nullptr, "pointer_socket"); }
@@ -102,10 +115,20 @@ void startPointer(const String &socketPath) {
   pointerWs.disconnect(); pointerWs.beginSSL(TV_IP, 3001, path); pointerWs.setReconnectInterval(3000);
 }
 
+String describeError(const JsonDocument &doc) {
+  String error = doc["error"] | "";
+  if (!error.length()) error = doc["payload"]["errorText"] | "";
+  if (!error.length() && !doc["payload"]["errorCode"].isNull()) error = String("errorCode ") + doc["payload"]["errorCode"].as<String>();
+  if (!error.length()) error = "sin detalle";
+  return error;
+}
+
 void controlEvent(WStype_t type, uint8_t *payload, size_t length) {
-  if (type == WStype_CONNECTED) { controlConnected = true; registered = false; sendRegistration(); return; }
-  if (type == WStype_DISCONNECTED) { controlConnected = registered = pointerConnected = false; return; }
+  if (type == WStype_CONNECTED) { Serial.println("TV: control socket connected"); controlConnected = true; registered = false; sendRegistration(); return; }
+  if (type == WStype_DISCONNECTED) { Serial.println("TV: control socket disconnected"); controlConnected = registered = pointerConnected = false; pendingId = ""; return; }
+  if (type == WStype_ERROR) { Serial.printf("TV: control socket error %.*s\n", (int)length, payload); return; }
   if (type != WStype_TEXT) return;
+  Serial.printf("TV <- %.*s\n", (int)min(length, (size_t)400), payload);
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) return;
   String messageType = doc["type"] | ""; String id = doc["id"] | "";
@@ -116,11 +139,18 @@ void controlEvent(WStype_t type, uint8_t *payload, size_t length) {
   } else if (id == "pointer_socket") {
     String socketPath = doc["payload"]["socketPath"] | "";
     if (socketPath.length()) startPointer(socketPath);
+    else lastAction = "Entrada de botones no disponible: " + describeError(doc);
+  } else if (id.length() && id == pendingId) {
+    bool ok = messageType == "response" && (doc["payload"]["returnValue"] | true);
+    lastAction = ok ? pendingCommand + " OK" : pendingCommand + " rechazado por la TV: " + describeError(doc);
+    pendingId = "";
   }
 }
 
-void pointerEvent(WStype_t type, uint8_t *, size_t) {
-  pointerConnected = type == WStype_CONNECTED ? true : type == WStype_DISCONNECTED ? false : pointerConnected;
+void pointerEvent(WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_CONNECTED) { Serial.println("TV: input socket connected"); pointerConnected = true; }
+  else if (type == WStype_DISCONNECTED) { Serial.println("TV: input socket disconnected"); pointerConnected = false; }
+  else if (type == WStype_ERROR) Serial.printf("TV: input socket error %.*s\n", (int)length, payload);
 }
 
 bool dispatchCommand(const String &command, String &message) {
@@ -138,18 +168,24 @@ bool dispatchCommand(const String &command, String &message) {
   if (!reachable) {
     controlWs.disconnect(); pointerWs.disconnect();
     controlConnected = registered = pointerConnected = false;
-    message = "TV offline or unreachable; press Power"; return false;
+    lastAction = message = "TV apagada o inaccesible; pulsa Power"; return false;
   }
-  if (!registered) { message = "TV reachable; waiting for connection or pairing"; return false; }
-  if (command == "POWER") sendRequest("ssap://system/turnOff");
-  else if (command == "VOLUMEUP") sendRequest("ssap://audio/volumeUp");
-  else if (command == "VOLUMEDOWN") sendRequest("ssap://audio/volumeDown");
-  else if (command == "CHANNELUP") sendRequest("ssap://tv/channelUp");
-  else if (command == "CHANNELDOWN") sendRequest("ssap://tv/channelDown");
-  else if (isButtonCommand(command)) {
-    if (!pointerConnected) { requestPointerSocket(); message = "Preparando entrada; vuelve a pulsar en un segundo"; return false; }
-    pointerWs.sendTXT(String("type:button\nname:") + command + "\n\n");
-  } else { message = "Comando no permitido"; return false; }
+  if (!registered) { lastAction = message = "TV accesible; esperando conexión o emparejamiento"; return false; }
+  pendingCommand = command;
+  if (command == "POWER") pendingId = sendRequest("ssap://system/turnOff");
+  else if (command == "VOLUMEUP") pendingId = sendRequest("ssap://audio/volumeUp");
+  else if (command == "VOLUMEDOWN") pendingId = sendRequest("ssap://audio/volumeDown");
+  else if (command == "CHANNELUP" || command == "CHANNELDOWN") {
+    // ssap://tv/channelUp|Down only works while the Live TV app is in the
+    // foreground; from an HDMI input or an app the TV answers with an error.
+    // The remote keys sent through the input socket behave like the physical
+    // remote (they switch to Live TV first), so prefer them when available.
+    if (pointerConnected) sendButton(command);
+    else { requestPointerSocket(); pendingId = sendRequest(command == "CHANNELUP" ? "ssap://tv/channelUp" : "ssap://tv/channelDown"); }
+  } else if (isButtonCommand(command)) {
+    if (!pointerConnected) { requestPointerSocket(); lastAction = message = "Preparando entrada de botones; vuelve a pulsar en un segundo"; return false; }
+    sendButton(command);
+  } else { lastAction = message = "Comando no permitido"; return false; }
   lastAction = command + " enviado"; message = lastAction; return true;
 }
 
