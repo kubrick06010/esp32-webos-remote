@@ -8,6 +8,9 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WiFiUdp.h>
+#include <lwip/etharp.h>
+#include <lwip/netif.h>
+#include <lwip/tcpip.h>
 
 #include "config.h"
 
@@ -26,6 +29,16 @@ String lastAction = "None yet";
 String pendingId;        // id of the last SSAP request still awaiting a reply
 String pendingCommand;   // remote button that produced it
 uint32_t requestId = 1;
+
+// The TV gets its address from DHCP, so TV_IP is only the initial guess.  The
+// address actually used is persisted and corrected at runtime by looking the
+// TV's MAC up in the ARP table (see serviceTvDiscovery).
+String tvIp = TV_IP;
+bool scanning = false;
+uint32_t scanHost = 0;         // next host offset in the subnet to probe
+uint32_t scanStepAt = 0;       // millis() when the next batch may be sent
+uint32_t lastScanEnd = 0;      // millis() when the last scan finished
+uint32_t disconnectedSince = 0;
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -52,16 +65,21 @@ bool isButtonCommand(const String &command) {
 
 bool tvReachable() {
   WiFiClient probe;
-  bool reachable = probe.connect(TV_IP, 3001, 700);
+  bool reachable = probe.connect(tvIp.c_str(), 3001, 700);
   probe.stop();
   return reachable;
 }
 
+bool parseTvMac(uint8_t mac[6]) {
+  unsigned int values[6];
+  if (sscanf(TV_MAC, "%x:%x:%x:%x:%x:%x", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) != 6) return false;
+  for (int i = 0; i < 6; ++i) mac[i] = values[i];
+  return true;
+}
+
 void sendWakeOnLan() {
   uint8_t mac[6];
-  unsigned int values[6];
-  if (sscanf(TV_MAC, "%x:%x:%x:%x:%x:%x", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) != 6) return;
-  for (int i = 0; i < 6; ++i) mac[i] = values[i];
+  if (!parseTvMac(mac)) return;
   uint8_t packet[102];
   memset(packet, 0xff, 6);
   for (int i = 1; i <= 16; ++i) memcpy(packet + i * 6, mac, 6);
@@ -112,7 +130,7 @@ void sendRegistration() {
 void startPointer(const String &socketPath) {
   int pathStart = socketPath.indexOf('/', socketPath.indexOf("//") + 2);
   String path = pathStart >= 0 ? socketPath.substring(pathStart) : "/resources";
-  pointerWs.disconnect(); pointerWs.beginSSL(TV_IP, 3001, path); pointerWs.setReconnectInterval(3000);
+  pointerWs.disconnect(); pointerWs.beginSSL(tvIp.c_str(), 3001, path); pointerWs.setReconnectInterval(3000);
 }
 
 String describeError(const JsonDocument &doc) {
@@ -153,6 +171,77 @@ void pointerEvent(WStype_t type, uint8_t *payload, size_t length) {
   else if (type == WStype_ERROR) Serial.printf("TV: input socket error %.*s\n", (int)length, payload);
 }
 
+// Returns true and the TV's current address if its MAC is in the ARP table.
+bool findTvInArpTable(IPAddress &found) {
+  uint8_t mac[6];
+  if (!parseTvMac(mac)) return false;
+  bool hit = false;
+  LOCK_TCPIP_CORE();
+  for (size_t i = 0; i < ARP_TABLE_SIZE && !hit; ++i) {
+    ip4_addr_t *ip; struct netif *nif; struct eth_addr *eth;
+    if (etharp_get_entry(i, &ip, &nif, &eth) && memcmp(eth->addr, mac, 6) == 0) {
+      found = IPAddress(ip4_addr1(ip), ip4_addr2(ip), ip4_addr3(ip), ip4_addr4(ip));
+      hit = true;
+    }
+  }
+  UNLOCK_TCPIP_CORE();
+  return hit;
+}
+
+void sendArpRequest(uint32_t hostOrderIp) {
+  ip4_addr_t target;
+  IP4_ADDR(&target, hostOrderIp >> 24, (hostOrderIp >> 16) & 0xff, (hostOrderIp >> 8) & 0xff, hostOrderIp & 0xff);
+  LOCK_TCPIP_CORE();
+  if (netif_default) etharp_request(netif_default, &target);
+  UNLOCK_TCPIP_CORE();
+}
+
+uint32_t toHostOrder(const IPAddress &ip) { return (uint32_t)ip[0] << 24 | (uint32_t)ip[1] << 16 | (uint32_t)ip[2] << 8 | ip[3]; }
+
+void useTvAddress(const IPAddress &ip) {
+  String address = ip.toString();
+  if (address == tvIp) return;
+  Serial.printf("TV: address changed %s -> %s\n", tvIp.c_str(), address.c_str());
+  tvIp = address;
+  preferences.putString("tvIp", tvIp);
+  pointerWs.disconnect(); controlWs.disconnect();
+  controlConnected = registered = pointerConnected = false;
+  controlWs.beginSSL(tvIp.c_str(), 3001, "/");
+}
+
+void requestTvDiscovery() { if (!scanning) { lastScanEnd = 0; disconnectedSince = millis() - 10000; } }
+
+// While the control socket is down, sweep the subnet with ARP requests a few
+// hosts at a time (non-blocking) until the TV's MAC answers, then reconnect to
+// that address.  Repeats at most once a minute while the TV stays missing.
+void serviceTvDiscovery() {
+  if (controlConnected || !WiFi.isConnected()) { scanning = false; disconnectedSince = 0; return; }
+  uint32_t now = millis();
+  if (!scanning) {
+    if (!disconnectedSince) disconnectedSince = now;
+    if (now - disconnectedSince < 10000) return;            // let normal reconnects try first
+    if (lastScanEnd && now - lastScanEnd < 60000) return;
+    scanning = true; scanHost = 1; scanStepAt = now;
+    Serial.println("TV: searching the network for its MAC");
+  }
+  if ((int32_t)(now - scanStepAt) < 0) return;
+  IPAddress found;
+  if (findTvInArpTable(found)) {
+    scanning = false; lastScanEnd = now;
+    Serial.printf("TV: found at %s\n", found.toString().c_str());
+    useTvAddress(found);
+    return;
+  }
+  uint32_t mask = toHostOrder(WiFi.subnetMask()), self = toHostOrder(WiFi.localIP());
+  uint32_t hosts = min<uint32_t>(~mask, 1024);
+  if (scanHost >= hosts) { scanning = false; lastScanEnd = now; Serial.println("TV: not found on the network"); return; }
+  for (int i = 0; i < 6 && scanHost < hosts; ++i, ++scanHost) {
+    uint32_t candidate = (self & mask) | scanHost;
+    if (candidate != self) sendArpRequest(candidate);
+  }
+  scanStepAt = now + 100;
+}
+
 bool dispatchCommand(const String &command, String &message) {
   bool reachable = tvReachable();
   // Some webOS TVs keep port 3001 reachable while in standby (Quick Start+).
@@ -168,7 +257,8 @@ bool dispatchCommand(const String &command, String &message) {
   if (!reachable) {
     controlWs.disconnect(); pointerWs.disconnect();
     controlConnected = registered = pointerConnected = false;
-    lastAction = message = "TV apagada o inaccesible; pulsa Power"; return false;
+    requestTvDiscovery();
+    lastAction = message = "TV no responde en " + tvIp + "; buscándola en la red"; return false;
   }
   if (!registered) { lastAction = message = "TV accesible; esperando conexión o emparejamiento"; return false; }
   pendingCommand = command;
@@ -192,7 +282,7 @@ bool dispatchCommand(const String &command, String &message) {
 void setupHttp() {
   server.on("/", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", PAGE); });
   server.on("/api/status", HTTP_GET, [] {
-    JsonDocument doc; doc["wifi"] = WiFi.isConnected(); doc["control"] = controlConnected; doc["registered"] = registered; doc["pointer"] = pointerConnected; doc["last"] = lastAction;
+    JsonDocument doc; doc["wifi"] = WiFi.isConnected(); doc["tv"] = tvIp; doc["control"] = controlConnected; doc["registered"] = registered; doc["pointer"] = pointerConnected; doc["last"] = lastAction;
     String body; serializeJson(doc, body); server.send(200, "application/json", body);
   });
   server.on("/api/command", HTTP_POST, [] {
@@ -209,7 +299,7 @@ void setupHttp() {
 
 void setup() {
   Serial.begin(115200);
-  preferences.begin("webos", false); clientKey = preferences.getString("clientKey", "");
+  preferences.begin("webos", false); clientKey = preferences.getString("clientKey", ""); tvIp = preferences.getString("tvIp", TV_IP);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);  // disable modem-sleep for lower latency (device is mains-powered)
   IPAddress local(REMOTE_IP), gateway(REMOTE_GATEWAY), subnet(REMOTE_SUBNET);
@@ -234,7 +324,7 @@ void setup() {
     MDNS.addServiceTxt("http", "tcp", "path", "/");
   }
   ArduinoOTA.setHostname(REMOTE_HOSTNAME); ArduinoOTA.begin();
-  controlWs.beginSSL(TV_IP, 3001, "/"); controlWs.onEvent(controlEvent); controlWs.setReconnectInterval(3000);
+  controlWs.beginSSL(tvIp.c_str(), 3001, "/"); controlWs.onEvent(controlEvent); controlWs.setReconnectInterval(3000);
   controlWs.enableHeartbeat(15000, 3000, 2);
   pointerWs.enableHeartbeat(15000, 3000, 2);
   pointerWs.onEvent(pointerEvent);
@@ -243,5 +333,5 @@ void setup() {
 }
 
 void loop() {
-  controlWs.loop(); pointerWs.loop(); server.handleClient(); ArduinoOTA.handle(); delay(2);
+  controlWs.loop(); pointerWs.loop(); serviceTvDiscovery(); server.handleClient(); ArduinoOTA.handle(); delay(2);
 }

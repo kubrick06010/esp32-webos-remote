@@ -12,7 +12,8 @@
 #define REMOTE_GATEWAY 192, 168, 1, 1
 #define REMOTE_SUBNET 255, 255, 255, 0
 
-// IP address, MAC address, and broadcast address of the LG TV to control.
+// LG TV to control. TV_MAC is what identifies it: TV_IP is only the initial
+// guess, the remote finds the TV by MAC (ARP) if DHCP gives it a new address.
 #define TV_IP "192.168.1.100"
 #define TV_MAC "AA:BB:CC:DD:EE:FF"
 #define WOL_BROADCAST "192.168.1.255"
