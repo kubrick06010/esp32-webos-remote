@@ -211,6 +211,7 @@ void setup() {
   Serial.begin(115200);
   preferences.begin("webos", false); clientKey = preferences.getString("clientKey", "");
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // disable modem-sleep for lower latency (device is mains-powered)
   IPAddress local(REMOTE_IP), gateway(REMOTE_GATEWAY), subnet(REMOTE_SUBNET);
   WiFi.config(local, gateway, subnet);
   WiFi.setHostname(REMOTE_HOSTNAME);
