@@ -11,6 +11,7 @@
 #include <lwip/etharp.h>
 #include <lwip/netif.h>
 #include <lwip/tcpip.h>
+#include <esp_system.h>
 
 #include "config.h"
 
@@ -39,6 +40,20 @@ uint32_t scanHost = 0;         // next host offset in the subnet to probe
 uint32_t scanStepAt = 0;       // millis() when the next batch may be sent
 uint32_t lastScanEnd = 0;      // millis() when the last scan finished
 uint32_t disconnectedSince = 0;
+
+// Network watchdog.  The board once stayed powered with loop() running but
+// unreachable on the LAN, so the link is checked actively and recovered by a
+// reconnect and, failing that, a restart.  The RTC_NOINIT counters survive the
+// restart so /api/status can tell afterwards what happened.
+RTC_NOINIT_ATTR uint32_t rtcMagic;
+RTC_NOINIT_ATTR uint32_t rtcWatchdogRestarts;
+RTC_NOINIT_ATTR uint32_t rtcLastRestartCause;   // 1 = Wi-Fi down, 2 = gateway unreachable
+uint32_t wifiDisconnects = 0;
+uint8_t lastDisconnectReason = 0;
+uint32_t wifiLostSince = 0;
+bool reconnectTried = false;
+uint32_t nextGatewayCheck = 0;
+uint8_t gatewayFailures = 0;
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -209,6 +224,49 @@ void useTvAddress(const IPAddress &ip) {
   controlWs.beginSSL(tvIp.c_str(), 3001, "/");
 }
 
+void restartForNetwork(uint32_t cause) {
+  Serial.printf("Network watchdog: restarting (cause %u)\n", cause);
+  rtcWatchdogRestarts++; rtcLastRestartCause = cause;
+  delay(100); ESP.restart();
+}
+
+// Wi-Fi down: reconnect after 15 s, restart after 60 s.  Wi-Fi "up" but the
+// gateway not answering TCP for 3 checks in a row (~90 s): reconnect, then
+// restart if it still fails.
+void serviceNetworkWatchdog() {
+  uint32_t now = millis();
+  if (!WiFi.isConnected()) {
+    if (!wifiLostSince) { wifiLostSince = now; reconnectTried = false; }
+    if (!reconnectTried && now - wifiLostSince > 15000) { Serial.println("Network watchdog: Wi-Fi down, reconnecting"); WiFi.reconnect(); reconnectTried = true; }
+    if (now - wifiLostSince > 60000) restartForNetwork(1);
+    return;
+  }
+  wifiLostSince = 0;
+  if ((int32_t)(now - nextGatewayCheck) < 0) return;
+  nextGatewayCheck = now + 30000;
+  WiFiClient probe;
+  bool ok = probe.connect(WiFi.gatewayIP(), 80, 1500);
+  probe.stop();
+  if (ok) { gatewayFailures = 0; return; }
+  ++gatewayFailures;
+  Serial.printf("Network watchdog: gateway unreachable (%u)\n", gatewayFailures);
+  if (gatewayFailures == 3) { WiFi.disconnect(false); WiFi.reconnect(); }
+  if (gatewayFailures >= 5) restartForNetwork(2);
+}
+
+const char *resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_USB: return "usb";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    default: return "other";
+  }
+}
+
 void requestTvDiscovery() { if (!scanning) { lastScanEnd = 0; disconnectedSince = millis() - 10000; } }
 
 // While the control socket is down, sweep the subnet with ARP requests a few
@@ -282,7 +340,10 @@ bool dispatchCommand(const String &command, String &message) {
 void setupHttp() {
   server.on("/", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", PAGE); });
   server.on("/api/status", HTTP_GET, [] {
-    JsonDocument doc; doc["wifi"] = WiFi.isConnected(); doc["tv"] = tvIp; doc["control"] = controlConnected; doc["registered"] = registered; doc["pointer"] = pointerConnected; doc["last"] = lastAction;
+    JsonDocument doc; doc["wifi"] = WiFi.isConnected(); doc["tv"] = tvIp;
+    doc["uptime_s"] = millis() / 1000; doc["reset"] = resetReasonName(); doc["rssi"] = WiFi.RSSI();
+    doc["wifi_drops"] = wifiDisconnects; doc["wifi_drop_reason"] = lastDisconnectReason;
+    doc["net_restarts"] = rtcWatchdogRestarts; doc["net_restart_cause"] = rtcLastRestartCause; doc["control"] = controlConnected; doc["registered"] = registered; doc["pointer"] = pointerConnected; doc["last"] = lastAction;
     String body; serializeJson(doc, body); server.send(200, "application/json", body);
   });
   server.on("/api/command", HTTP_POST, [] {
@@ -300,7 +361,14 @@ void setupHttp() {
 void setup() {
   Serial.begin(115200);
   preferences.begin("webos", false); clientKey = preferences.getString("clientKey", ""); tvIp = preferences.getString("tvIp", TV_IP);
+  if (rtcMagic != 0x57D06EAD || esp_reset_reason() == ESP_RST_POWERON) { rtcMagic = 0x57D06EAD; rtcWatchdogRestarts = 0; rtcLastRestartCause = 0; }
+  Serial.printf("Boot: reset=%s net_restarts=%u\n", resetReasonName(), rtcWatchdogRestarts);
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    ++wifiDisconnects; lastDisconnectReason = info.wifi_sta_disconnected.reason;
+    Serial.printf("Wi-Fi: disconnected, reason %u\n", lastDisconnectReason);
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);  // disable modem-sleep for lower latency (device is mains-powered)
   IPAddress local(REMOTE_IP), gateway(REMOTE_GATEWAY), subnet(REMOTE_SUBNET);
   WiFi.config(local, gateway, subnet);
@@ -333,5 +401,5 @@ void setup() {
 }
 
 void loop() {
-  controlWs.loop(); pointerWs.loop(); serviceTvDiscovery(); server.handleClient(); ArduinoOTA.handle(); delay(2);
+  controlWs.loop(); pointerWs.loop(); serviceTvDiscovery(); serviceNetworkWatchdog(); server.handleClient(); ArduinoOTA.handle(); delay(2);
 }
